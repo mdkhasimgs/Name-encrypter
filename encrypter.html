@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Encrypt & Share (User/Admin)</title>
+<script src="https://apis.google.com/js/api.js"></script>
+<style>
+  :root{--bg:#071027;--card:#071424;--accent:#6ad1ff;--muted:#9fb7c9;--btn:#238636;--btn2:#0b5bdc;--danger:#b02737}
+  body{background:var(--bg);color:#e6eef6;font-family:Inter,Segoe UI,Arial;padding:28px;display:flex;justify-content:center}
+  .card{width:100%;max-width:980px;background:linear-gradient(180deg,#071424,#0f1724);border-radius:12px;padding:20px;border:1px solid #1b2a36;box-shadow:0 10px 30px rgba(0,0,0,0.5)}
+  h1{color:var(--accent);margin:0 0 12px}
+  label{font-size:13px;color:var(--muted)}
+  input,textarea,select{width:100%;padding:10px;margin:8px 0;border-radius:8px;border:1px solid #21323e;background:var(--card);color:#e6eef6;font-family:monospace}
+  textarea{height:120px;resize:vertical}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  button{background:var(--btn);border:none;color:#fff;padding:10px 14px;border-radius:8px;cursor:pointer}
+  button.secondary{background:var(--btn2)}
+  button.danger{background:var(--danger)}
+  .muted{color:var(--muted);font-size:13px}
+  .output{background:var(--card);border:1px solid #203040;border-radius:8px;padding:10px;white-space:pre-wrap;word-break:break-all;font-family:monospace}
+  .file-list{margin-top:12px;border:1px dashed #1f2b36;padding:8px;border-radius:6px;max-height:220px;overflow:auto}
+  .file-item{display:flex;justify-content:space-between;align-items:center;padding:6px;border-bottom:1px dashed rgba(255,255,255,0.02)}
+  .hidden{display:none!important}
+  .topbar{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+  .status{margin-left:auto;font-size:13px;color:var(--muted)}
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="topbar">
+      <h1>🔐 Encrypt & Share</h1>
+      <div class="status" id="modeLabel">Mode: User</div>
+    </div>
+
+    <!-- DRIVE CONTROLS (visible only in admin mode after password check) -->
+    <div id="adminControls" class="hidden">
+      <div class="row" style="align-items:center;margin-bottom:8px;">
+        <button id="authorize_button">Connect Google Drive</button>
+        <button id="signout_button" class="danger hidden">Sign out</button>
+        <div style="flex:1"></div>
+        <div id="status" class="muted">Not connected</div>
+      </div>
+    </div>
+
+    <!-- COMMON UI -->
+    <label>Password (used for AES key):</label>
+    <input id="password" type="password" placeholder="Enter password to encrypt/decrypt">
+
+    <label>Message (type message to encrypt, or paste encrypted text to decrypt):</label>
+    <textarea id="inputText" placeholder="Type or paste here..."></textarea>
+
+    <div class="row" style="margin-bottom:10px;">
+      <button id="encryptBtn">Encrypt 🔒</button>
+      <button id="decryptBtn" class="secondary">Decrypt 🔓</button>
+      <button id="copyBtn" class="secondary">Copy Output</button>
+      <button id="clearBtn" class="danger">Clear</button>
+    </div>
+
+    <label>Output:</label>
+    <div id="output" class="output">Encrypted text or decrypted message appears here</div>
+
+    <!-- ADMIN-ONLY UPLOAD / SHARE UI -->
+    <div id="adminUploadArea" class="hidden" style="margin-top:14px">
+      <div style="margin-top:12px;display:flex;gap:10px;align-items:center;">
+        <label style="margin:0">Make uploaded file shareable?</label>
+        <select id="shareMode" style="width:auto">
+          <option value="no">No — private in my Drive</option>
+          <option value="yes">Yes — anyone-with-link</option>
+        </select>
+        <small class="muted" style="margin-left:8px">If Yes → app will create a share link for the file.</small>
+      </div>
+
+      <div class="row" style="margin-top:10px;">
+        <button id="uploadBtn">Encrypt & Upload to Drive</button>
+        <button id="listFilesBtn" class="secondary">Refresh EncryptedVault</button>
+      </div>
+
+      <h3 style="margin-top:18px">EncryptedVault files (in your Drive)</h3>
+      <div id="files" class="file-list"><div class="muted">Connect to Drive to list files...</div></div>
+    </div>
+
+  </div>
+
+<script>
+/* ================== CONFIG - REPLACE THESE ================== */
+const CLIENT_ID = "YOUR_CLIENT_ID_HERE";      // <--- replace with your Google OAuth client id
+const API_KEY   = "YOUR_API_KEY_HERE";        // <--- replace with your API key
+const ADMIN_PASSWORD = "Shanucom101@"; // <--- set a strong admin password
+/* ========================================================== */
+
+const DISCOVERY_DOCS = ["https://www.googleapis.com/discovery/v1/apis/drive/v3/rest"];
+const SCOPES = "https://www.googleapis.com/auth/drive"; // full drive for creating folder + permissions
+
+// Elements
+const adminControls = document.getElementById('adminControls');
+const adminUploadArea = document.getElementById('adminUploadArea');
+const modeLabel = document.getElementById('modeLabel');
+const statusEl = document.getElementById('status');
+const filesEl = document.getElementById('files');
+const outputEl = document.getElementById('output');
+const inputText = document.getElementById('inputText');
+const passwordInput = document.getElementById('password');
+
+let folderIdCache = null;
+
+// Determine if current path is admin path.
+// On GitHub Pages place the same file as admin/index.html so path contains '/admin'.
+const isAdminPath = () => {
+  const p = location.pathname || '';
+  return p.includes('/admin') || p.endsWith('/admin.html');
+};
+
+// Show user vs admin UI
+function showAppropriateUI() {
+  if (isAdminPath()) {
+    // Ask admin password first
+    const attempt = prompt("Enter admin password to open admin panel:");
+    if (attempt === ADMIN_PASSWORD) {
+      modeLabel.innerText = "Mode: ADMIN";
+      adminControls.classList.remove('hidden');
+      adminUploadArea.classList.remove('hidden');
+      // initialize Google API for admin actions
+      handleClientLoad();
+    } else {
+      alert("Wrong admin password — opening in User mode.");
+      modeLabel.innerText = "Mode: User (admin locked)";
+      // admin controls remain hidden
+    }
+  } else {
+    // User mode
+    modeLabel.innerText = "Mode: User";
+  }
+}
+
+/* ========================= WebCrypto helpers ========================= */
+async function getKeyFromPassword(password, saltText="static-salt") {
+  const enc = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey(
+    {name:'PBKDF2', salt:enc.encode(saltText), iterations:150000, hash:'SHA-256'},
+    keyMaterial,
+    {name:'AES-GCM', length:256},
+    false,
+    ['encrypt','decrypt']
+  );
+}
+function bufToBase64(buf){
+  const bytes = new Uint8Array(buf);
+  let bin = '';
+  for (let i=0;i<bytes.byteLength;i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+function base64ToBuf(base64){
+  const bin = atob(base64);
+  const len = bin.length;
+  const bytes = new Uint8Array(len);
+  for (let i=0;i<len;i++) bytes[i] = bin.charCodeAt(i);
+  return bytes.buffer;
+}
+async function encryptString(plainText, password) {
+  const key = await getKeyFromPassword(password);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const enc = new TextEncoder();
+  const cipher = await crypto.subtle.encrypt({name:'AES-GCM', iv}, key, enc.encode(plainText));
+  const combined = new Uint8Array(iv.byteLength + cipher.byteLength);
+  combined.set(iv, 0);
+  combined.set(new Uint8Array(cipher), iv.byteLength);
+  return bufToBase64(combined.buffer);
+}
+async function decryptString(base64Combined, password) {
+  const combinedBuf = base64ToBuf(base64Combined);
+  const combined = new Uint8Array(combinedBuf);
+  const iv = combined.slice(0,12);
+  const ct = combined.slice(12).buffer;
+  const key = await getKeyFromPassword(password);
+  const dec = await crypto.subtle.decrypt({name:'AES-GCM', iv}, key, ct);
+  return new TextDecoder().decode(dec);
+}
+
+/* ========================= Basic UI actions ========================= */
+document.getElementById('encryptBtn').onclick = async () => {
+  const text = inputText.value;
+  const pw = passwordInput.value;
+  if (!text) return alert('Enter message to encrypt.');
+  if (!pw) return alert('Enter password.');
+  try {
+    outputEl.innerText = 'Encrypting...';
+    const base64 = await encryptString(text, pw);
+    outputEl.innerText = base64;
+    // Save last encrypted locally as safety
+    localStorage.setItem('lastEncrypted', base64);
+  } catch (err) {
+    alert('Encryption failed: ' + (err.message || err));
+  }
+};
+
+document.getElementById('decryptBtn').onclick = async () => {
+  const base64 = inputText.value.trim();
+  const pw = passwordInput.value;
+  if (!base64) return alert('Paste encrypted text into the message box to decrypt.');
+  if (!pw) return alert('Enter password.');
+  try {
+    const dec = await decryptString(base64, pw);
+    outputEl.innerText = dec;
+  } catch (err) {
+    alert('Decryption failed — wrong password or invalid encrypted text.');
+  }
+};
+
+document.getElementById('copyBtn').onclick = async () => {
+  const t = outputEl.innerText.trim();
+  if (!t) return alert('Nothing to copy.');
+  await navigator.clipboard.writeText(t);
+  alert('Copied output to clipboard.');
+};
+document.getElementById('clearBtn').onclick = () => {
+  inputText.value = ''; passwordInput.value = ''; outputEl.innerText = 'Encrypted text or decrypted message appears here';
+};
+
+/* ========================= Google Drive (admin-only) ========================= */
+function handleClientLoad(){ if (!CLIENT_ID || !API_KEY) { console.warn('CLIENT_ID/API_KEY not set'); return; } gapi.load('client:auth2', initClient); }
+
+async function initClient() {
+  try {
+    await gapi.client.init({ apiKey: API_KEY, clientId: CLIENT_ID, discoveryDocs: DISCOVERY_DOCS, scope: SCOPES });
+    gapi.auth2.getAuthInstance().isSignedIn.listen(updateSigninStatus);
+    updateSigninStatus(gapi.auth2.getAuthInstance().isSignedIn.get());
+    document.getElementById('authorize_button').onclick = handleAuthClick;
+    document.getElementById('signout_button').onclick = handleSignoutClick;
+    document.getElementById('uploadBtn').onclick = onEncryptUpload;
+    document.getElementById('listFilesBtn').onclick = listFiles;
+  } catch (e) { console.error(e); alert('gapi init failed. Check CLIENT_ID/API_KEY.'); }
+}
+
+function updateSigninStatus(isSignedIn) {
+  if (isSignedIn) {
+    document.getElementById('authorize_button').style.display = 'none';
+    document.getElementById('signout_button').classList.remove('hidden');
+    statusEl.innerText = 'Connected — ready';
+    listFiles();
+  } else {
+    document.getElementById('authorize_button').style.display = 'inline-block';
+    document.getElementById('signout_button').classList.add('hidden');
+    statusEl.innerText = 'Not connected';
+    filesEl.innerHTML = '<div class="muted">Connect to Drive to list files...</div>';
+    folderIdCache = null;
+  }
+}
+
+function handleAuthClick(){ gapi.auth2.getAuthInstance().signIn(); }
+function handleSignoutClick(){ gapi.auth2.getAuthInstance().signOut(); folderIdCache = null; }
+
+/* Drive helpers */
+async function ensureFolder() {
+  if (folderIdCache) return folderIdCache;
+  const q = "mimeType='application/vnd.google-apps.folder' and name='EncryptedVault' and trashed=false";
+  const resp = await gapi.client.drive.files.list({ q, fields: "files(id,name)" });
+  if (resp.result.files && resp.result.files.length) { folderIdCache = resp.result.files[0].id; return folderIdCache; }
+  const created = await gapi.client.drive.files.create({ resource: { name:'EncryptedVault', mimeType:'application/vnd.google-apps.folder' }, fields: 'id' });
+  folderIdCache = created.result.id; return folderIdCache;
+}
+
+async function uploadEncrypted(base64Text, filename='enc_'+Date.now()+'.enc', makePublic=false) {
+  const folderId = await ensureFolder();
+  const boundary = "-------314159265358979323846";
+  const delimiter = "\r\n--" + boundary + "\r\n";
+  const close_delim = "\r\n--" + boundary + "--";
+  const metadata = { name: filename, parents: [folderId], mimeType: 'application/octet-stream' };
+  const multipartRequestBody =
+    delimiter +
+    'Content-Type: application/json; charset=UTF-8\r\n\r\n' +
+    JSON.stringify(metadata) +
+    '\r\n' + "--" + boundary + "\r\n" +
+    "Content-Type: application/octet-stream\r\n" +
+    "Content-Transfer-Encoding: base64\r\n\r\n" +
+    base64Text +
+    close_delim;
+  const request = gapi.client.request({ path: '/upload/drive/v3/files', method: 'POST', params: { uploadType: 'multipart', fields: 'id,name,webViewLink' }, headers: { 'Content-Type': 'multipart/related; boundary=' + boundary }, body: multipartRequestBody });
+  const resp = await request;
+  const file = resp.result;
+  if (makePublic) {
+    await gapi.client.drive.permissions.create({ fileId: file.id, resource: { role: 'reader', type: 'anyone' } });
+    return { id: file.id, name: file.name, link: `https://drive.google.com/file/d/${file.id}/view?usp=sharing` };
+  } else {
+    return { id: file.id, name: file.name, link: file.webViewLink || ('https://drive.google.com/file/d/'+file.id+'/view') };
+  }
+}
+
+async function listFiles() {
+  try {
+    const folderId = await ensureFolder();
+    const q = `'${folderId}' in parents and trashed=false`;
+    const resp = await gapi.client.drive.files.list({ q, fields: "files(id,name,modifiedTime,size)", orderBy:"modifiedTime desc" });
+    renderFileList(resp.result.files || []);
+  } catch(err) {
+    filesEl.innerHTML = '<div class="muted">Unable to list files: '+(err.message||err)+'</div>';
+  }
+}
+
+function renderFileList(files) {
+  if (!files.length) { filesEl.innerHTML = '<div class="muted">No files in EncryptedVault.</div>'; return; }
+  filesEl.innerHTML = '';
+  files.forEach(f=>{
+    const d = document.createElement('div'); d.className='file-item';
+    d.innerHTML = `<div><strong>${escapeHtml(f.name)}</strong><div class="muted" style="font-size:12px">${f.modifiedTime || ''}</div></div>`;
+    const btns = document.createElement('div');
+    const dl = document.createElement('button'); dl.textContent='Load & Decrypt';
+    dl.onclick = ()=>downloadAndDecrypt(f.id, f.name);
+    const linkBtn = document.createElement('button'); linkBtn.textContent='Get Link'; linkBtn.className='secondary';
+    linkBtn.onclick = ()=>alert('Share link: https://drive.google.com/file/d/' + f.id + '/view?usp=sharing');
+    const del = document.createElement('button'); del.textContent='Delete'; del.className='danger';
+    del.onclick = ()=>{ if(confirm('Delete file?')) { gapi.client.drive.files.delete({fileId:f.id}).then(()=>listFiles()); } };
+    btns.appendChild(dl); btns.appendChild(linkBtn); btns.appendChild(del);
+    d.appendChild(btns); filesEl.appendChild(d);
+  });
+}
+
+async function downloadAndDecrypt(fileId, name) {
+  try {
+    const res = await gapi.client.drive.files.get({ fileId, alt: 'media' });
+    let body = res.body.trim();
+    const pw = passwordInput.value;
+    if (!pw) return alert('Enter password to decrypt.');
+    const decrypted = await decryptString(body, pw);
+    outputEl.innerText = `Filename: ${name}\n\n${decrypted}`;
+  } catch(err) {
+    alert('Download or decrypt failed: ' + (err.result?.error?.message || err.message || err));
+  }
+}
+
+/* Admin only: encrypt & upload action */
+async function onEncryptUpload() {
+  const text = inputText.value;
+  const pw = passwordInput.value;
+  if (!text) return alert('Enter message to encrypt.');
+  if (!pw) return alert('Enter password.');
+  try {
+    outputEl.innerText = 'Encrypting...';
+    const base64 = await encryptString(text, pw);
+    outputEl.innerText = base64;
+    // copy to clipboard prompt
+    if (confirm('Copy encrypted text to clipboard?')) {
+      await navigator.clipboard.writeText(base64);
+      alert('Copied. You can paste this for your friend OR upload to Drive.');
+    }
+    if (gapi.auth2.getAuthInstance().isSignedIn.get()) {
+      const makePublic = document.getElementById('shareMode').value === 'yes';
+      const fname = prompt('Filename to save to Drive', `enc_${Date.now()}.enc`);
+      if (!fname) return;
+      const result = await uploadEncrypted(base64, fname, makePublic);
+      alert('Uploaded. Link: ' + result.link);
+      listFiles();
+    } else {
+      if (confirm('Not connected to Drive. Do you want to download the encrypted file locally?')) {
+        downloadAsFile(base64, 'encrypted.enc');
+      }
+    }
+  } catch (err) {
+    alert('Encryption/upload failed: ' + (err.message||err));
+  }
+}
+
+/* ========================= misc helpers ========================= */
+function escapeHtml(s){ return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function downloadAsFile(base64, filename){
+  const bin = atob(base64);
+  const len = bin.length;
+  const bytes = new Uint8Array(len);
+  for (let i=0;i<len;i++) bytes[i]=bin.charCodeAt(i);
+  const blob = new Blob([bytes], {type:'application/octet-stream'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url; a.download = filename; a.click();
+  URL.revokeObjectURL(url);
+}
+
+/* ========================= startup ========================= */
+window.onload = () => {
+  // restore last encrypted if any
+  const last = localStorage.getItem('lastEncrypted');
+  if (last) outputEl.innerText = "🔁 Last saved encrypted text:\n\n" + last;
+  showAppropriateUI();
+};
+</script>
+</body>
+</html>
